@@ -92,7 +92,7 @@
         {{- '<|im_start|>system\n' + reasoning_instructions + '<|im_end|>\n' }}
     {%- endif %}
 {%- endif %}
-{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
+{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1, open_assistant=false) %}
 {%- for message in messages[::-1] %}
     {%- set index = (messages|length - 1) - loop.index0 %}
     {%- if ns.multi_step_tool and message.role == "user" %}
@@ -155,7 +155,11 @@
                 {{- '</function>\n</tool_call>' }}
             {%- endfor %}
         {%- endif %}
-        {{- '<|im_end|>\n' }}
+        {%- if loop.last and (content or reasoning_content) and not (message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping) %}
+            {%- set ns.open_assistant = true %}
+        {%- else %}
+            {{- '<|im_end|>\n' }}
+        {%- endif %}
     {%- elif message.role == "tool" %}
         {%- if loop.previtem and loop.previtem.role != "tool" %}
             {{- '<|im_start|>user' }}
@@ -173,7 +177,7 @@
     {%- endif %}
     {%- endif %}
 {%- endfor %}
-{%- if add_generation_prompt %}
+{%- if add_generation_prompt and not ns.open_assistant %}
     {{- '<|im_start|>assistant\n' }}
     {%- if enable_thinking is defined and enable_thinking is false %}
         {{- '<think>\n\n</think>\n\n' }}

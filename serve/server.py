@@ -55,8 +55,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
-                            tool_choice_of, unmark_think_literals)
+                            continues_reply, forced_call, images_of, literal_tags, mark_think_literals,
+                            openai_to_messages, tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
@@ -145,9 +145,12 @@ VISION_START = "<|vision_start|>"
 REPEAT_STOP_TOKENS = 256
 ANSWER_RESERVE_MIN = 512      # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
-# #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
-# and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
+# #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token with its thinking not followed by
+# an answer - still inside <think>, or closed and stopped before the answer - is continued once: the thinking is closed
+# (the same way the budget's wrap-up closes it) when it never closed, and the blank line the template puts after
+# </think> is written when it did
 REASONING_CLOSE = "\n</think>\n\n"
+REASONING_BLANK = "\n\n"
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
 # "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
@@ -2865,7 +2868,7 @@ class Service:
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
-        self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
+        self.reasoning_close_retry = False            # #1053 (opt-in): continue once a reply that ends with no answer
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
         self.codex_thread_titles = False              # #923 (opt-in): answer Codex's thread-title turns without the engine
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
@@ -3522,7 +3525,9 @@ class Service:
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
-        if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
+        # a reply being continued has no place after its open turn for the short effort turn: it is rendered as asked
+        if (not self.effort_end or (not off and effort in (None, "", "xhigh", "high"))
+                or continues_reply(messages)):
             return self.template.render(messages, tools=tools, **kwargs)
         base = {k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
         history = self.template.render(messages, tools=tools, add_generation_prompt=False, **base)
@@ -3676,7 +3681,9 @@ class Service:
             write_temporary(combined, [p for p, _ in encoded])
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))
-        return ids, kwargs.get("enable_thinking", True) is not False, max_new
+        # A request whose last message is the reply to continue (an assistant message with text and no calls) leaves
+        # that turn open in the prompt: the reply continues what it says, so it never starts a fresh thinking turn.
+        return ids, kwargs.get("enable_thinking", True) is not False and not continues_reply(messages), max_new
 
     PREFIX_END = "\u0001strata-prefix-end\u0001"          # marks where a message's shared part ends in the rendered prompt
 
@@ -4096,17 +4103,30 @@ class Service:
                                   f"(coverage={repeat_coverage:.3f}); resuming the same output with the low-effort "
                                   "instruction (reasoning_loop_recovery)", flush=True)
                             continue
-                        if (self.reasoning_close_retry and thinking and finish == "stop" and not close_retried
-                                and not answered and not wrap and not opens and parser.state == "reasoning"
-                                and parser.buf != THINK_END         # #537: not after a held </think>, the end
+                        # #1053: how such a reply is continued.  The thinking never closed: close it.  It closed and the
+                        # answer never started - the closing </think> still held for the character after it (#537), or
+                        # already past it into the answer's opening blank lines: write the blank line the template puts
+                        # after the tag, which also settles a held tag as the thinking's end, and go on from there.
+                        if parser.state == "reasoning" and parser.buf != THINK_END:
+                            close_extra = REASONING_CLOSE
+                            close_msg = "the reply ended inside its thinking with no answer: closing the thinking " \
+                                        "once and continuing"
+                        elif parser.state == "reasoning" or (parser.state == "content" and not parser.buf
+                                                             and not detok.pending()):
+                            close_extra = REASONING_BLANK
+                            close_msg = "the reply ended right after its thinking closed with no answer: continuing " \
+                                        "once past the blank line"
+                        else:
+                            close_extra, close_msg = None, None
+                        if (close_extra is not None and self.reasoning_close_retry and thinking
+                                and finish == "stop" and not close_retried
+                                and not answered and not wrap and not opens
                                 and (stops is None or stops.hit is None) and not cancel.is_set()):
-                            # #1053: the model wrote its reasoning and stopped before </think>: the client would get
-                            # an empty answer.  Close the thinking once and let it answer.
+                            # #1053: the client would get an empty answer.  Continue the reply once and let it answer.
                             close_retried = True
-                            extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
+                            extra = self.tok.encode(close_extra, parse_special=True)
                             if max_new - n - len(extra) >= 1:
-                                print("[strata] the reply ended inside its thinking with no answer: closing the "
-                                      "thinking once and continuing (reasoning_close_retry)", flush=True)
+                                print(f"[strata] {close_msg} (reasoning_close_retry)", flush=True)
                                 for t in extra:
                                     n += 1
                                     raw_ids.append(t)

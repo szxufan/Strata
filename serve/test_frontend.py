@@ -69,6 +69,46 @@ class EmptyAssistantHistory(unittest.TestCase):
                                        {"role": "assistant", "content": ""}], add_generation_prompt=False)
         self.assertIn("<|im_start|>assistant\n", prompt)
 
+
+class ContinueReply(unittest.TestCase):
+    """A request whose last message is the reply to continue (an assistant message with text or reasoning, no tool
+    calls): that turn stays open - no <|im_end|>, no generation prompt, so no fresh <think> - and the reply continues
+    what it says."""
+
+    def setUp(self):
+        self.template = ChatTemplate(Path(__file__).with_name("chat_template.jinja"))
+
+    def test_text_is_left_open_with_no_second_assistant_turn(self):
+        prompt = self.template.render([{"role": "user", "content": "2+2?"},
+                                       {"role": "assistant", "content": "The answer is"}])
+        self.assertTrue(prompt.endswith("The answer is"))
+        self.assertEqual(prompt.count("<|im_start|>assistant"), 1)
+
+    def test_reasoning_then_text_is_left_open_after_the_text(self):
+        prompt = self.template.render([{"role": "user", "content": "2+2?"},
+                                       {"role": "assistant", "reasoning_content": "four.",
+                                        "content": "So the answer is"}])
+        self.assertTrue(prompt.endswith("So the answer is"))
+
+    def test_reasoning_only_ends_at_the_blank_line_after_the_tag(self):
+        prompt = self.template.render([{"role": "user", "content": "2+2?"},
+                                       {"role": "assistant", "reasoning_content": "four.", "content": ""}])
+        self.assertTrue(prompt.endswith("</think>" + chr(10) + chr(10)))
+
+    def test_a_turn_with_calls_still_ends_and_a_new_one_opens(self):
+        prompt = self.template.render(
+            [{"role": "user", "content": "2+2?"},
+             {"role": "assistant", "content": "",
+              "tool_calls": [{"function": {"name": "f", "arguments": {}}}]}],
+            tools=[{"name": "f", "description": "", "parameters": {"type": "object"}}])
+        self.assertTrue(prompt.endswith("<think>" + chr(10)))
+        self.assertIn("</tool_call><|im_end|>" + chr(10) + "<|im_start|>assistant", prompt)
+
+    def test_an_empty_trailing_turn_still_opens_a_new_one(self):
+        prompt = self.template.render([{"role": "user", "content": "2+2?"},
+                                       {"role": "assistant", "content": ""}])
+        self.assertTrue(prompt.endswith("<think>" + chr(10)))
+
     def test_empty_user_and_tool_turns_are_kept(self):
         prompt = self.template.render([{"role": "user", "content": ""},
                                        {"role": "tool", "content": ""},

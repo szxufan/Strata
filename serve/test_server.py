@@ -3541,6 +3541,21 @@ class EndsInsideThinkingEngine(ThinkingEngine):
             yield t
 
 
+class EndsAfterThinkingEngine(ThinkingEngine):
+    """The other shape of the same empty answer: the reasoning closes its </think> (THOUGHT ends with it), then the
+    end-of-turn token, no answer.  A prompt that has moved past the tag gets the answer."""
+    THOUGHT = "Let me think: two plus two is four.\n</think>\n\n"
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.prompts.append(list(ids))
+        done = self.tok.decode(ids).rstrip().endswith("</think>")
+        text = self.ANSWER if done else self.THOUGHT
+        for t in (self.tok.encode(text) + self.tok.encode("<|im_end|>", parse_special=True))[:max_new]:
+            if cancel.is_set():
+                return
+            yield t
+
+
 class ReasoningCloseRetry(unittest.TestCase):
     """#1053 (opt-in): a reply that ends inside <think> with no answer is continued once with the thinking closed."""
 
@@ -3583,14 +3598,106 @@ class ReasoningCloseRetry(unittest.TestCase):
         self.assertEqual(len(self.engine.prompts), 1)
         self.assertEqual(c["message"]["content"], "Fine.")
 
-    def test_a_reply_that_closed_its_thinking_right_after_a_quote_is_not_touched(self):
-        # #537: that </think> waits for the character after it; the end of the turn makes it the end of the thinking
+    def test_a_reply_that_closed_its_thinking_right_after_a_quote_answers_on_the_retry(self):
+        # #537: that </think> waits for the character after it; the blank line the retry writes settles it as the
+        # thinking's end, and the reply continues from there
         self.svc.reasoning_close_retry = True
         self.engine.THOUGHT = 'two plus two is "4"</think>'
         c = self.chat()
+        self.assertEqual(len(self.engine.prompts), 2)
+        self.assertEqual(c["message"]["content"], EndsInsideThinkingEngine.ANSWER)
+        self.assertEqual(c["message"]["reasoning_content"], 'two plus two is "4"')
+
+
+class ReasoningCloseRetryAfterClose(unittest.TestCase):
+    """The same empty answer with the thinking already closed (its </think> written, then the end-of-turn token):
+    the retry writes the blank line after the tag and continues, opt-in and once per request as #1053's."""
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.engine = EndsAfterThinkingEngine(self.tok)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def chat(self):
+        body = {"model": "m", "messages": [{"role": "user", "content": "2+2?"}], "max_tokens": 300}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode())["choices"][0]
+
+    def test_off_by_default_the_reply_stays_empty(self):
+        c = self.chat()
         self.assertEqual(len(self.engine.prompts), 1)
         self.assertFalse(c["message"].get("content"))
-        self.assertEqual(c["message"]["reasoning_content"], 'two plus two is "4"')
+        self.assertIn("two plus two is four", c["message"]["reasoning_content"])
+
+    def test_on_it_continues_past_the_closed_thinking_once_and_answers(self):
+        self.svc.reasoning_close_retry = True
+        c = self.chat()
+        self.assertEqual(len(self.engine.prompts), 2)
+        self.assertTrue(self.tok.decode(self.engine.prompts[1]).endswith("</think>" + chr(10) * 4))
+        self.assertEqual(c["message"]["content"], EndsAfterThinkingEngine.ANSWER)
+        self.assertIn("two plus two is four", c["message"]["reasoning_content"])
+        self.assertEqual(c["finish_reason"], "stop")
+
+
+class ContinuesReplyEngine(MockEngine):
+    """Records its prompts and completes an open reply: what the model continues the last message with."""
+    def __init__(self, tok):
+        super().__init__(tok, "x", max_context=CTX)
+        self.prompts = []
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.prompts.append(list(ids))
+        for t in (self.tok.encode(" 4.") + self.tok.encode("<|im_end|>", parse_special=True))[:max_new]:
+            if cancel.is_set():
+                return
+            yield t
+
+
+class ContinueReply(unittest.TestCase):
+    """A request whose last message is the reply to continue: the prompt ends with that message (no fresh <think>
+    opened after it) and the reply is its continuation, in the answer, not a new thinking turn."""
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.engine = ContinuesReplyEngine(self.tok)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def chat(self, messages):
+        body = {"model": "m", "messages": messages, "max_tokens": 100}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode())["choices"][0]
+
+    def test_the_prompt_ends_with_the_message_and_the_reply_continues_it(self):
+        c = self.chat([{"role": "user", "content": "2+2?"},
+                       {"role": "assistant", "content": "The answer is"}])
+        self.assertEqual(len(self.engine.prompts), 1)
+        prompt = self.tok.decode(self.engine.prompts[0])
+        self.assertTrue(prompt.endswith("The answer is"))
+        self.assertEqual(c["message"]["content"], " 4.")
+        self.assertFalse(c["message"].get("reasoning_content"))
+        self.assertEqual(c["finish_reason"], "stop")
+
+    def test_a_reasoning_only_message_is_answered_from_its_blank_line(self):
+        c = self.chat([{"role": "user", "content": "2+2?"},
+                       {"role": "assistant", "content": "", "reasoning_content": "two plus two is four."}])
+        self.assertTrue(self.tok.decode(self.engine.prompts[0]).endswith("</think>" + chr(10) + chr(10)))
+        self.assertEqual(c["message"]["content"], " 4.")
 
 
 class ThinkingBudget(unittest.TestCase):

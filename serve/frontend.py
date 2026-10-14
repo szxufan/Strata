@@ -127,6 +127,22 @@ def _text_of(content) -> str:
                    TEXT_PARTS)
 
 
+def continues_reply(messages) -> bool:
+    """True when the conversation's last message is the reply to continue: an assistant message with text or
+    reasoning and no tool calls.  The template leaves that turn open (no <|im_end|>, no generation prompt), so the
+    engine continues what it says instead of starting a fresh reply with a new <think>.  The template's own rule -
+    chat_template.jinja's `open_assistant` - must stay the same as this one."""
+    m = messages[-1] if messages else None
+    if not isinstance(m, dict) or m.get("role") != "assistant":
+        return False
+    calls = m.get("tool_calls")
+    if calls and isinstance(calls, list):
+        return False
+    rc = m.get("reasoning_content")
+    return bool(_text_of(m.get("content")).strip() or _has_image(m.get("content"))
+                or (rc if isinstance(rc, str) else "").strip())
+
+
 IMAGE_PARTS = ("image_url", "input_image", "image")
 
 # Thinking levels.  The model's template knows low, medium and xhigh (its default; "high" means xhigh), and

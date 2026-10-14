@@ -1,0 +1,20 @@
+[Unit]
+Description=Strata server (OrcaRouter Qwen3.8-Flash-Next-Uncensored IQ3_XXS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xufan
+WorkingDirectory=/home/xufan/Strata
+ExecStart=/home/xufan/Strata/.venv/bin/python -m serve.server --engine strata --config strata-orca-iq3_xxs.json --port 8080
+Restart=on-failure
+RestartSec=15
+TimeoutStartSec=900
+# model load pins tens of GB of RAM and both GPUs; stop gracefully
+KillSignal=SIGINT
+TimeoutStopSec=120
+LimitMEMLOCK=64M
+
+[Install]
+WantedBy=multi-user.target

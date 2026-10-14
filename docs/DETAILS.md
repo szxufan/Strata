@@ -748,6 +748,10 @@ print(r.choices[0].message.content)
   `high`) in `strata-<model>.json`, outside `"args"` (#1641): the engine has no such option, and `--reasoning-effort` in
   `"args"` is moved to this key with a note at startup. The web app's shared Chat settings ("Use for other apps too") and a
   request's own level win over it.
+- **The last message can be the reply to continue.** A request whose last message is an assistant message with text or
+  `reasoning_content` and no tool calls continues that message: the prompt ends with what it says (no `<|im_end|>`, no
+  new `<think>`), and the reply is its continuation, in the answer - a reasoning-only message leaves the thinking
+  closed, so the model answers from there. The reply returns only what the model adds, as Anthropic's prefill does.
 - **Keep Windows awake while it works (opt-in, #1727).** `"prevent_sleep": true` in `strata-<model>.json` keeps the PC
   from going to sleep while at least one request is running or waiting (Windows' `SetThreadExecutionState` with
   `ES_SYSTEM_REQUIRED`; the screen may still turn off), and gives the normal sleep rules back when the server is idle
@@ -758,10 +762,12 @@ print(r.choices[0].message.content)
   part of the thinking the client sees and counts as output tokens. `"reasoning_budget_tokens": N` in
   `strata-<model>.json` sets it for every request; a request's own value wins, and `0` means no budget. Off by default;
   Anthropic's `"thinking": {"budget_tokens": N}` still only chooses the level, as above.
-- **A reply that ends inside its thinking (#1053, opt-in).** Some turns write a sentence of reasoning and then the
-  end-of-turn token with no `</think>`: the content is empty and an agent stops. `"reasoning_close_retry": true` in
-  `strata-<model>.json` closes the thinking once (as the thinking budget does) and continues, once per request, only for
-  a reply that ended that way with no answer and no tool call. Off by default.
+- **A reply that ends with no answer after its thinking (#1053, opt-in).** Some turns write a sentence of reasoning
+  and then the end-of-turn token with no `</think>`, or close the thinking and stop before the answer: the content is
+  empty and an agent stops. `"reasoning_close_retry": true` in `strata-<model>.json` continues such a reply once -
+  closing the thinking (as the thinking budget does) when it never closed, or writing the blank line the template puts
+  after `</think>` when it did - once per request, only for a reply that ended that way with no answer and no tool
+  call. Off by default.
 - **A reply stuck on one token is ended (0.1.39, #606).** When a reply repeats the same token 256 times in a row, the
   server ends it there with `finish_reason` `"length"` and says so in its window: a model in a loop, or a broken
   state that answers one token forever (#606 saw 36,689 tokens of `!`). `"repeat_stop_tokens": N` in
