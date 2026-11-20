@@ -583,7 +583,10 @@ class TablesMatchTheSources(unittest.TestCase):
         for t, i in Q.REF_TOKENIZER["key_tokens"].items():
             self.assertEqual(special[t], i)
         tpl = serve_template_hash()
-        self.assertEqual(tpl[:12], "12827f24b742")
+        # This fork's chat_template.jinja adds the open_assistant continuation rule (8df2f632:
+        # continue from the last assistant message), so its hash differs from upstream's canonical
+        # Flash-Next template (12827f24b742). Pin this fork's template here.
+        self.assertEqual(tpl[:12], "57a1e6c075d2")
 
 
 def serve_template_hash() -> str:
